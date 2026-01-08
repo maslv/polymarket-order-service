@@ -1,61 +1,128 @@
 import express from "express";
+import fetch from "node-fetch";
 import { ClobClient, Side } from "@polymarket/clob-client";
 import { Wallet } from "ethers";
-
-const app = express();
-app.use(express.json());
 
 const HOST = "https://clob.polymarket.com";
 const CHAIN_ID = 137;
 
-const {
-  PRIVATE_KEY,
-  FUNDER_ADDRESS,
-  SIGNATURE_TYPE = "2",
-  ORDER_SERVICE_KEY,
-  PORT = "3000",
-} = process.env;
+const PORT = process.env.PORT || 3000;
 
-if (!PRIVATE_KEY) throw new Error("Missing PRIVATE_KEY");
-if (!FUNDER_ADDRESS) throw new Error("Missing FUNDER_ADDRESS");
-if (!ORDER_SERVICE_KEY) throw new Error("Missing ORDER_SERVICE_KEY");
+function must(name) {
+  const v = process.env[name];
+  if (!v) throw new Error(`Missing env var: ${name}`);
+  return v;
+}
 
-let clientPromise = initClient();
+const PRIVATE_KEY = must("PRIVATE_KEY");
+const SERVICE_TOKEN = must("SERVICE_TOKEN");
+
+// For most Polymarket users using MetaMask + proxy wallet, signature type is 2.
+// (Docs also show signature type table and funder address instructions.) :contentReference[oaicite:6]{index=6}
+const SIGNATURE_TYPE = Number(process.env.SIGNATURE_TYPE || "2");
+const FUNDER_ADDRESS = process.env.FUNDER_ADDRESS || undefined;
+
+// If you ever need a different API key “slot”, you can change nonce. :contentReference[oaicite:7]{index=7}
+const API_KEY_NONCE = Number(process.env.API_KEY_NONCE || "0");
+
+const signer = new Wallet(PRIVATE_KEY);
+let client;
 
 async function initClient() {
-  // Polymarket quickstart: create client + createOrDeriveApiKey(), then trade. :contentReference[oaicite:4]{index=4}
-  const signer = new Wallet(PRIVATE_KEY);
   const tempClient = new ClobClient(HOST, CHAIN_ID, signer);
-  const apiCreds = await tempClient.createOrDeriveApiKey();
+  const apiCreds = await tempClient.createOrDeriveApiKey(API_KEY_NONCE);
 
-  // Polymarket L2 methods: initialize with signer + api creds + signatureType + funder. :contentReference[oaicite:5]{index=5}
-  return new ClobClient(HOST, CHAIN_ID, signer, apiCreds, Number(SIGNATURE_TYPE), FUNDER_ADDRESS);
+  if (SIGNATURE_TYPE === 2 && !FUNDER_ADDRESS) {
+    throw new Error(
+      "SIGNATURE_TYPE=2 requires FUNDER_ADDRESS (your Polymarket Profile/Wallet address from polymarket.com/settings)."
+    );
+  }
+
+  client = new ClobClient(HOST, CHAIN_ID, signer, apiCreds, SIGNATURE_TYPE, FUNDER_ADDRESS);
 }
 
-function authed(req) {
-  return req.headers["x-order-service-key"] === ORDER_SERVICE_KEY;
-}
+await initClient();
 
-app.get("/health", (_req, res) => res.json({ ok: true }));
+const app = express();
+app.use(express.json({ limit: "1mb" }));
 
-app.post("/order", async (req, res) => {
-  if (!authed(req)) return res.status(401).json({ error: "Unauthorized" });
-
-  const { tokenID, price, size, side = "BUY" } = req.body || {};
-  if (!tokenID) return res.status(400).json({ error: "tokenID required" });
-  if (price === undefined) return res.status(400).json({ error: "price required" });
-  if (size === undefined) return res.status(400).json({ error: "size required" });
-
-  const client = await clientPromise;
-
-  const resp = await client.createAndPostOrder({
-    tokenID,
-    price: Number(price),
-    size: Number(size),
-    side: String(side).toUpperCase() === "SELL" ? Side.SELL : Side.BUY,
+// Health check
+app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
+    signerAddress: signer.address,
+    signatureType: SIGNATURE_TYPE,
+    hasFunder: Boolean(FUNDER_ADDRESS),
   });
-
-  res.json(resp);
 });
 
-app.listen(Number(PORT), () => console.log("Listening on", PORT));
+// Check if THIS SERVER is geoblocked (important!)
+app.get("/geoblock", async (req, res) => {
+  const r = await fetch("https://polymarket.com/api/geoblock");
+  const data = await r.json();
+  res.json(data);
+});
+
+function auth(req, res, next) {
+  const token = req.header("x-service-token");
+  if (!token || token !== SERVICE_TOKEN) {
+    return res.status(401).json({ ok: false, error: "Unauthorized" });
+  }
+  next();
+}
+
+/**
+ * POST /trade
+ * Body for LIMIT order: { tokenID, side: "BUY", price, size, tickSize? }
+ * Body for MARKET order: { tokenID, side: "BUY", amount, price?, tickSize? }
+ *
+ * - price is optional for market order (acts like a max price for BUY).
+ * - tickSize must match the market (often "0.01"). :contentReference[oaicite:8]{index=8}
+ */
+app.post("/trade", auth, async (req, res) => {
+  try {
+    const { tokenID, side, price, size, amount, tickSize } = req.body || {};
+    if (!tokenID) return res.status(400).json({ ok: false, error: "tokenID is required" });
+
+    const sideEnum = String(side).toUpperCase() === "SELL" ? Side.SELL : Side.BUY;
+    const options = { tickSize: String(tickSize || "0.01") };
+
+    let resp;
+
+    if (amount !== undefined && amount !== null) {
+      // Market order: amount = dollars for BUY, shares for SELL (per docs). :contentReference[oaicite:9]{index=9}
+      resp = await client.createAndPostMarketOrder(
+        {
+          tokenID,
+          amount: Number(amount),
+          side: sideEnum,
+          price: price !== undefined && price !== null ? Number(price) : undefined
+        },
+        options
+      );
+    } else {
+      if (price === undefined || size === undefined) {
+        return res.status(400).json({
+          ok: false,
+          error: "For a LIMIT order provide price + size. For a MARKET order provide amount."
+        });
+      }
+
+      resp = await client.createAndPostOrder(
+        {
+          tokenID,
+          price: Number(price),
+          size: Number(size),
+          side: sideEnum
+        },
+        options
+      );
+    }
+
+    res.json({ ok: true, resp });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+app.listen(PORT, () => console.log(`Order service listening on ${PORT}`));
